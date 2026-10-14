@@ -11,7 +11,8 @@ permissions:
   id-token: write
 
 env:
-  IMAGE_NAME: ghcr.io/m-lmran/devops-vle5:latest
+  IMAGE_NAME: ghcr.io/m-lmran/devops-vle5
+  IMAGE_TAG: ${{ github.sha }}
   AWS_REGION: us-east-1
   EC2_INSTANCE_ID: i-00cc1f36f97ff9294
 
@@ -24,42 +25,59 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t "$IMAGE_NAME" .
+        run: |
+          docker build \
+            -t "$IMAGE_NAME:$IMAGE_TAG" \
+            -t "$IMAGE_NAME:latest" .
 
       - name: Login to GitHub Container Registry
-        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io \
+            -u "$GITHUB_ACTOR" --password-stdin
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish Docker image
-        run: docker push "$IMAGE_NAME"
+      - name: Publish Docker images
+        run: |
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:latest"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::598391748654:role/GitHubDevOpsLabDeployRole
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to EC2 through SSM
-        id: deploy
+      - name: Deploy to Kubernetes through SSM
         run: |
+          set -e
+
+          PARAMETERS=$(jq -n \
+            --arg image "$IMAGE_NAME:$IMAGE_TAG" \
+            '{
+              commands: [
+                "set -e",
+                ("sudo k3s kubectl set image deployment/devops-app devops-app=" + $image),
+                "sudo k3s kubectl rollout status deployment/devops-app --timeout=180s",
+                "sudo k3s kubectl get deployment devops-app",
+                "sudo k3s kubectl get pods -l app=devops-app"
+              ]
+            }')
+
           COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy DevOps Virtual Lab" \
-            --parameters 'commands=[
-              "sudo docker pull ghcr.io/m-lmran/devops-vle5:latest",
-              "sudo docker stop devops-virtual-lab || true",
-              "sudo docker rm devops-virtual-lab || true",
-              "sudo docker run -d --name devops-virtual-lab --restart unless-stopped -p 8080:8080 ghcr.io/m-lmran/devops-vle5:latest"
-            ]' \
+            --comment "Deploy DevOps app to Kubernetes" \
+            --parameters "$PARAMETERS" \
             --query 'Command.CommandId' \
             --output text)
 
           echo "SSM command ID: $COMMAND_ID"
 
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
             STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
               --query 'Status' \
@@ -68,11 +86,20 @@ jobs:
             echo "Deployment status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$EC2_INSTANCE_ID" \
+                --query 'StandardOutputContent' \
+                --output text
               exit 0
             fi
 
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            if [ "$STATUS" = "Failed" ] ||
+               [ "$STATUS" = "Cancelled" ] ||
+               [ "$STATUS" = "TimedOut" ]; then
               aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$EC2_INSTANCE_ID" \
                 --output json || true
