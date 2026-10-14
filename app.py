@@ -15,7 +15,7 @@ class Handler(BaseHTTPRequestHandler):
         <body>
             <h1>DevOps CI/CD Pipeline</h1>
             <p>Application is running successfully!</p>
-            <p>Deployed using Docker and automated DevOps tools.</p>
+            <p>automatically Deployed by github actions ;).</p>
         </body>
         </html>
         """
